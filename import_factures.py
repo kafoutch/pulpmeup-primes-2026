@@ -2,44 +2,26 @@
 """
 Import incrémental des factures Pennylane → Google Sheet PulpMeUp
 ──────────────────────────────────────────────────────────────────
-Ce script fait TOUT — aucun Apps Script requis.
-
-Actions à chaque run :
-  1. Authentification Google (service account JWT, sans interaction)
-  2. Lecture des factures existantes dans le Sheet
-  3. Récupération de toutes les factures Pennylane depuis START_DATE
-  4. Détection des avoirs → factures créditées marquées "Exclure" en col I
-  5. Ajout des nouvelles factures uniquement (import incrémental)
-  6. Mise à jour du statut de paiement des factures existantes
-  7. Enrichissement encaissement (M/N) pour factures payées sans date
-  8. Tracking colonne J : pour toute cellule J modifiée par l'équipe
-     (valeur présente, col K vide), écrit la date du run et USER_EMAIL en K/L
-
 Colonnes du Sheet "(Auto)Liste des factures" :
-  A  Date d'émission        E  Montant HT (€)
-  B  Nom du client          F  Statut paiement
-  C  N° de facture          G  Type (Acompte / Partielle / Clôture / vide)
-  D  Catégorie              H  Montant devis HT (€)
-                            I  Prise en compte (Claude auto) ← ce script
-                            J  Modification équipe           ← modifié manuellement
-                            K  Modifié le                    ← rempli par ce script
-                            L  Modifié par                   ← rempli par ce script
-                            M  Date d'encaissement           ← ce script (Pennylane)
-                            N  Montant encaissé HT (€)       ← ce script (Pennylane)
+  A  Date d'émission
+  B  Nom du client
+  C  N° de facture
+  D  Montant devis HT (€)       ← devis lié, vide si aucun
+  E  Catégorie
+  F  Statut paiement
+  G  Montant Encaissé HT (€)    ← montant HT facture une fois payée
+  H  Date Encaissement           ← date transaction Pennylane
 
-Note : pour forcer un recalcul de M/N sur des factures payées,
-       effacer le contenu de la colonne M dans le Sheet puis relancer.
-
-Usage :
-  python3 import_factures.py
-  python3 import_factures.py --email prenom@pulpmeup.com   (override USER_EMAIL)
+Modes :
+  python3 import_factures.py             → incrémental (nouvelles + màj)
+  python3 import_factures.py --rebuild   → efface tout et réimporte depuis START_DATE
 """
 
 import json, os, sys, time, base64, subprocess, urllib.request, urllib.parse
 from datetime import datetime
 
 # ──────────────────────────────────────────────────────────────────
-#  CONFIGURATION  (env vars prioritaires, fallback local)
+#  CONFIGURATION
 # ──────────────────────────────────────────────────────────────────
 
 PENNYLANE_TOKEN = os.environ.get("PENNYLANE_TOKEN",
@@ -49,17 +31,15 @@ SA_FILE         = os.environ.get("SA_FILE",
 SHEET_ID        = "1KO3fnOlxsnEedl8NUH93r9aIUqwc-3zJYrjwsMDx0yc"
 INVOICE_TAB     = "(Auto)Liste des factures"
 START_DATE      = "2026-01-01"
-USER_EMAIL      = "fxmorre@pulpmeup.com"
 
 PENNYLANE_BASE  = "https://app.pennylane.com/api/external/v2"
 SHEETS_BASE     = "https://sheets.googleapis.com/v4/spreadsheets"
 
-MONTH_NAMES = {
-    1: "Janvier 2026",  2: "Février 2026",   3: "Mars 2026",
-    4: "Avril 2026",    5: "Mai 2026",        6: "Juin 2026",
-    7: "Juillet 2026",  8: "Août 2026",       9: "Septembre 2026",
-    10: "Octobre 2026", 11: "Novembre 2026",  12: "Décembre 2026",
-}
+HEADERS = [
+    "Date d'émission", "Nom du client", "N° de facture",
+    "Montant devis HT (€)", "Catégorie", "Statut paiement",
+    "Montant Encaissé HT (€)", "Date Encaissement",
+]
 
 STATUS_MAP = {
     "paid":      "Payée",
@@ -71,7 +51,7 @@ STATUS_MAP = {
 }
 
 # ──────────────────────────────────────────────────────────────────
-#  SERVICE ACCOUNT — reconstruit depuis SA_JSON env var si présent
+#  SERVICE ACCOUNT
 # ──────────────────────────────────────────────────────────────────
 
 def load_sa():
@@ -85,7 +65,7 @@ def load_sa():
     return SA_FILE
 
 # ──────────────────────────────────────────────────────────────────
-#  AUTH GOOGLE — service account JWT signé via openssl
+#  AUTH GOOGLE
 # ──────────────────────────────────────────────────────────────────
 
 def get_google_token():
@@ -164,7 +144,7 @@ def fetch_all_invoices():
 
 
 def fetch_payment_date(inv_id):
-    """Retourne la date (FR) de la transaction d'encaissement la plus récente, ou ''."""
+    """Date FR de la transaction d'encaissement la plus récente, ou ''."""
     try:
         data  = pl_get(f"/customer_invoices/{inv_id}/matched_transactions")
         items = data.get("items", [])
@@ -184,6 +164,16 @@ def sheets_get(gtoken, range_name):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {gtoken}"})
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read()).get("values", [])
+
+
+def sheets_clear(gtoken, range_name):
+    url = f"{SHEETS_BASE}/{SHEET_ID}/values/{urllib.parse.quote(range_name)}:clear"
+    req = urllib.request.Request(url, data=b"{}", headers={
+        "Authorization": f"Bearer {gtoken}",
+        "Content-Type":  "application/json",
+    }, method="POST")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
 
 
 def sheets_append(gtoken, range_name, values):
@@ -218,10 +208,7 @@ def sheets_batch_put(gtoken, updates):
     url  = f"{SHEETS_BASE}/{SHEET_ID}/values:batchUpdate"
     body = {
         "valueInputOption": "RAW",
-        "data": [
-            {"range": r, "values": v}
-            for r, v in updates
-        ],
+        "data": [{"range": r, "values": v} for r, v in updates],
     }
     data = json.dumps(body).encode()
     req  = urllib.request.Request(url, data=data, headers={
@@ -246,33 +233,8 @@ def date_iso_to_fr(iso):
     p = iso.split("-")
     return f"{p[2]}/{p[1]}/{p[0]}"
 
-
-def month_from_fr_date(date_fr):
-    try:
-        return MONTH_NAMES.get(int(date_fr.split("/")[1]), "")
-    except Exception:
-        return ""
-
-
-def detect_invoice_type(line_items, inv_label):
-    labels = " ".join(l.get("label", "").lower() for l in line_items)
-    all_labels = labels + " " + inv_label.lower()
-    has_negative = any(float(l.get("currency_amount_before_tax", 0)) < 0 for l in line_items)
-    is_acompte   = any(k in all_labels for k in ("acompte", "deposit", "avance", "à-valoir", "a-valoir"))
-    is_partielle = any(k in all_labels for k in ("partiel", "partielle", "situation", "intermédiaire", "progress", "tranche"))
-    if is_acompte:   return "Acompte"
-    if has_negative: return "Clôture"
-    if is_partielle: return "Partielle"
-    return ""
-
-
-def auto_prise_en_compte(inv_type, inv_status, date_fr):
-    if inv_type in ("Acompte", "Partielle") or inv_status == "cancelled":
-        return "Exclure"
-    return month_from_fr_date(date_fr)
-
 # ──────────────────────────────────────────────────────────────────
-#  ENRICHISSEMENT D'UNE FACTURE
+#  ENRICHISSEMENT D'UNE FACTURE → 8 colonnes
 # ──────────────────────────────────────────────────────────────────
 
 def enrich(inv, customer_cache, quote_cache):
@@ -285,11 +247,6 @@ def enrich(inv, customer_cache, quote_cache):
     cat_str = ", ".join(c["label"] for c in cats.get("items", [])) or "N/A"
     time.sleep(0.08)
 
-    lines      = pl_get(f"/customer_invoices/{inv['id']}/invoice_lines")
-    line_items = lines.get("items", [])
-    inv_type   = detect_invoice_type(line_items, inv.get("label", ""))
-    time.sleep(0.08)
-
     quote_ht = ""
     if inv.get("quote"):
         qid = inv["quote"]["id"]
@@ -300,188 +257,151 @@ def enrich(inv, customer_cache, quote_cache):
 
     statut  = STATUS_MAP.get(inv["status"], inv["status"])
     date_fr = date_iso_to_fr(inv["date"])
-    pec     = auto_prise_en_compte(inv_type, inv["status"], date_fr)
 
-    # Encaissement (cols M, N)
-    encaiss_date   = ""
     encaiss_amount = ""
+    encaiss_date   = ""
     if inv["status"] == "paid":
-        encaiss_date   = fetch_payment_date(inv["id"])
         encaiss_amount = fmt(inv["currency_amount_before_tax"])
+        encaiss_date   = fetch_payment_date(inv["id"])
         time.sleep(0.08)
 
     return [date_fr, customer_cache[cid], inv["invoice_number"],
-            cat_str, fmt(inv["currency_amount_before_tax"]),
-            statut, inv_type, quote_ht, pec,
-            "", "", "",             # J, K, L  (équipe / tracking)
-            encaiss_date, encaiss_amount]  # M, N
+            quote_ht, cat_str, statut,
+            encaiss_amount, encaiss_date]
+
+# ──────────────────────────────────────────────────────────────────
+#  REBUILD — efface tout et réimporte depuis START_DATE
+# ──────────────────────────────────────────────────────────────────
+
+def run_rebuild(gtoken):
+    print(f"\n[REBUILD] Effacement de l'onglet '{INVOICE_TAB}'...")
+    sheets_clear(gtoken, f"{INVOICE_TAB}!A1:Z2000")
+
+    print("[REBUILD] Écriture des en-têtes...")
+    sheets_put(gtoken, f"{INVOICE_TAB}!A1:H1", [HEADERS])
+
+    print(f"[REBUILD] Récupération depuis Pennylane (depuis {START_DATE})...")
+    all_invoices = fetch_all_invoices()
+    print(f"         {len(all_invoices)} factures brutes")
+
+    # Exclure les avoirs
+    avoir_ids = {inv["id"] for inv in all_invoices if inv.get("credited_invoice")}
+    invoices  = [inv for inv in all_invoices if inv["id"] not in avoir_ids]
+    print(f"         {len(avoir_ids)} avoir(s) exclu(s) → {len(invoices)} à importer")
+
+    print("[REBUILD] Enrichissement en cours (clients, catégories, devis, paiements)...")
+    customer_cache, quote_cache, rows = {}, {}, []
+    for i, inv in enumerate(invoices):
+        rows.append(enrich(inv, customer_cache, quote_cache))
+        if (i + 1) % 10 == 0:
+            print(f"         {i+1}/{len(invoices)} traitées...")
+
+    print(f"[REBUILD] Écriture de {len(rows)} lignes dans le Sheet...")
+    # Envoi par blocs de 200 pour éviter les timeouts
+    for start in range(0, len(rows), 200):
+        chunk = rows[start:start+200]
+        sheets_append(gtoken, f"{INVOICE_TAB}!A:H", chunk)
+        if len(rows) > 200:
+            print(f"         bloc {start+1}–{start+len(chunk)} envoyé")
+
+    print(f"[REBUILD] ✓ {len(rows)} lignes importées.")
+    return len(rows)
+
+# ──────────────────────────────────────────────────────────────────
+#  INCREMENTAL — nouvelles factures + màj statut + màj encaissement
+# ──────────────────────────────────────────────────────────────────
+
+def run_incremental(gtoken):
+    print(f"\n[1/4] Lecture des factures existantes...")
+    existing_rows = sheets_get(gtoken, f"{INVOICE_TAB}!A2:H2000")
+
+    existing_nums   = {}
+    existing_status = {}
+    existing_g      = {}
+
+    for i, row in enumerate(existing_rows):
+        row = row + [""] * (8 - len(row))
+        num = row[2]
+        if num:
+            existing_nums[num]   = i
+            existing_status[num] = row[5]
+            existing_g[num]      = row[6]   # col G = Montant Encaissé
+
+    print(f"      {len(existing_nums)} factures présentes")
+
+    print(f"\n[2/4] Récupération depuis Pennylane (depuis {START_DATE})...")
+    all_invoices = fetch_all_invoices()
+    avoir_ids    = {inv["id"] for inv in all_invoices if inv.get("credited_invoice")}
+    invoices     = [inv for inv in all_invoices if inv["id"] not in avoir_ids]
+    print(f"      {len(invoices)} factures (hors avoirs)")
+
+    new_invoices = [inv for inv in invoices if inv["invoice_number"] not in existing_nums]
+    print(f"\n[3/4] Nouvelles factures : {len(new_invoices)}")
+
+    added = 0
+    if new_invoices:
+        customer_cache, quote_cache, new_rows = {}, {}, []
+        for i, inv in enumerate(new_invoices):
+            new_rows.append(enrich(inv, customer_cache, quote_cache))
+            if (i + 1) % 10 == 0:
+                print(f"      {i+1}/{len(new_invoices)} traitées...")
+        result = sheets_append(gtoken, f"{INVOICE_TAB}!A:H", new_rows)
+        added  = result.get("updates", {}).get("updatedRows", len(new_rows))
+        print(f"      ✓ {added} ligne(s) ajoutée(s)")
+
+    print(f"\n[4/4] Mises à jour (statut + encaissement)...")
+    updates = []
+    for inv in invoices:
+        num    = inv["invoice_number"]
+        new_st = STATUS_MAP.get(inv["status"], inv["status"])
+        if num not in existing_nums:
+            continue
+        sheet_row = existing_nums[num] + 2
+
+        if existing_status[num] != new_st:
+            updates.append((f"{INVOICE_TAB}!F{sheet_row}", [[new_st]]))
+
+        if inv["status"] == "paid" and existing_g.get(num, "") == "":
+            pay_date = fetch_payment_date(inv["id"])
+            time.sleep(0.08)
+            if pay_date:
+                updates.append((f"{INVOICE_TAB}!G{sheet_row}",
+                                 [[fmt(inv["currency_amount_before_tax"])]]))
+                updates.append((f"{INVOICE_TAB}!H{sheet_row}", [[pay_date]]))
+
+    if updates:
+        sheets_batch_put(gtoken, updates)
+    print(f"      ✓ {len(updates)} cellule(s) mise(s) à jour")
+    return added, len(updates)
 
 # ──────────────────────────────────────────────────────────────────
 #  MAIN
 # ──────────────────────────────────────────────────────────────────
 
 def main():
-    global USER_EMAIL
-    if "--email" in sys.argv:
-        idx = sys.argv.index("--email")
-        if idx + 1 < len(sys.argv):
-            USER_EMAIL = sys.argv[idx + 1]
-
+    rebuild = "--rebuild" in sys.argv
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     print("=" * 62)
-    print("  Import incrémental Pennylane → Google Sheet — PulpMeUp")
-    print(f"  Run : {now_str}  |  Opérateur : {USER_EMAIL}")
+    print("  Import Pennylane → Google Sheet — PulpMeUp")
+    print(f"  Run : {now_str}  |  Mode : {'REBUILD' if rebuild else 'incrémental'}")
     print("=" * 62)
 
-    print("\n[1/8] Authentification Google (service account)...")
+    print("\nAuthentification Google...")
     gtoken = get_google_token()
-    print("      ✓ Token OK")
+    print("✓ Token OK")
 
-    # Écriture des en-têtes M1/N1 si nécessaire
-    headers_row = sheets_get(gtoken, f"{INVOICE_TAB}!M1:N1")
-    if not headers_row or not headers_row[0]:
-        sheets_batch_put(gtoken, [
-            (f"{INVOICE_TAB}!M1", [["Date d'encaissement"]]),
-            (f"{INVOICE_TAB}!N1", [["Montant encaissé HT (€)"]]),
-        ])
-        print("      ✓ En-têtes M1/N1 écrits")
-
-    print(f"\n[2/8] Lecture des factures existantes dans le Sheet...")
-    existing_rows = sheets_get(gtoken, f"{INVOICE_TAB}!A2:N2000")
-
-    existing_nums   = {}
-    existing_status = {}
-    existing_m      = {}
-    j_pending       = []
-
-    for i, row in enumerate(existing_rows):
-        row = row + [""] * (14 - len(row))
-        num = row[2]
-        if num:
-            existing_nums[num]   = i
-            existing_status[num] = row[5]
-            existing_m[num]      = row[12]   # col M
-        j_val = row[9]
-        k_val = row[10]
-        if j_val and not k_val:
-            j_pending.append(i + 2)
-
-    print(f"      {len(existing_nums)} factures présentes")
-    print(f"      {len(j_pending)} modification(s) équipe non tracée(s) en colonne J")
-
-    print(f"\n[3/8] Récupération depuis Pennylane (depuis {START_DATE})...")
-    all_invoices = fetch_all_invoices()
-    print(f"      {len(all_invoices)} factures récupérées")
-
-    print("\n[4/8] Détection des avoirs...")
-    avoir_ids         = set()
-    credited_ids      = set()
-    credited_in_sheet = {}
-    all_by_id         = {inv["id"]: inv for inv in all_invoices}
-
-    for inv in all_invoices:
-        if inv.get("credited_invoice"):
-            avoir_ids.add(inv["id"])
-            orig_id  = inv["credited_invoice"]["id"]
-            orig_inv = all_by_id.get(orig_id)
-            if orig_inv:
-                orig_num = orig_inv["invoice_number"]
-                credited_ids.add(orig_id)
-                if orig_num in existing_nums:
-                    credited_in_sheet[orig_num] = existing_nums[orig_num]
-
-    to_skip = avoir_ids | credited_ids
-    print(f"      Avoirs : {len(avoir_ids)}  |  Factures créditées : {len(credited_ids)}")
-
-    new_invoices = [
-        inv for inv in all_invoices
-        if inv["invoice_number"] not in existing_nums
-        and inv["id"] not in to_skip
-    ]
-    print(f"\n[5/8] Nouvelles factures à importer : {len(new_invoices)}")
-
-    added = 0
-    if new_invoices:
-        print("      Enrichissement (clients, catégories, lignes, devis, encaissement)...")
-        customer_cache, quote_cache, new_rows = {}, {}, []
-        for i, inv in enumerate(new_invoices):
-            new_rows.append(enrich(inv, customer_cache, quote_cache))
-            if (i + 1) % 10 == 0:
-                print(f"      {i+1}/{len(new_invoices)} traitées...")
-        result = sheets_append(gtoken, f"{INVOICE_TAB}!A:N", new_rows)
-        added  = result.get("updates", {}).get("updatedRows", len(new_rows))
-        print(f"      ✓ {added} nouvelle(s) ligne(s) ajoutée(s)")
-
-    print(f"\n[6/8] Mise à jour des statuts de paiement...")
-    status_updates = []
-    for inv in all_invoices:
-        num    = inv["invoice_number"]
-        new_st = STATUS_MAP.get(inv["status"], inv["status"])
-        if num in existing_status and existing_status[num] != new_st:
-            sheet_row = existing_nums[num] + 2
-            status_updates.append((f"{INVOICE_TAB}!F{sheet_row}", [[new_st]]))
-            print(f"      Ligne {sheet_row} ({num}) : {existing_status[num]} → {new_st}")
-
-    if status_updates:
-        sheets_batch_put(gtoken, status_updates)
-        print(f"      ✓ {len(status_updates)} statut(s) mis à jour")
+    if rebuild:
+        total = run_rebuild(gtoken)
+        print("\n" + "=" * 62)
+        print(f"  ✓ REBUILD terminé — {total} factures importées")
+        print("=" * 62)
     else:
-        print("      Aucun statut à modifier")
-
-    if credited_in_sheet:
-        print(f"\n      Factures créditées → Exclure...")
-        avoir_updates = []
-        for num, row_idx in credited_in_sheet.items():
-            sheet_row = row_idx + 2
-            avoir_updates.append((f"{INVOICE_TAB}!I{sheet_row}", [["Exclure"]]))
-            print(f"      Ligne {sheet_row} ({num}) → Exclure")
-        sheets_batch_put(gtoken, avoir_updates)
-
-    print(f"\n[7/8] Enrichissement encaissement (cols M/N) pour factures payées...")
-    payment_updates = []
-    for inv in all_invoices:
-        num = inv["invoice_number"]
-        if (
-            num in existing_nums
-            and inv["status"] == "paid"
-            and existing_m.get(num, "") == ""
-        ):
-            sheet_row  = existing_nums[num] + 2
-            pay_date   = fetch_payment_date(inv["id"])
-            time.sleep(0.08)
-            if pay_date:
-                pay_amt = fmt(inv["currency_amount_before_tax"])
-                payment_updates.append((f"{INVOICE_TAB}!M{sheet_row}", [[pay_date]]))
-                payment_updates.append((f"{INVOICE_TAB}!N{sheet_row}", [[pay_amt]]))
-                print(f"      Ligne {sheet_row} ({num}) → encaissé {pay_date} / {pay_amt} €")
-
-    if payment_updates:
-        sheets_batch_put(gtoken, payment_updates)
-        print(f"      ✓ {len(payment_updates)//2} encaissement(s) renseigné(s)")
-    else:
-        print("      Aucun encaissement manquant")
-
-    print(f"\n[8/8] Tracking modifications équipe (colonne J)...")
-    if j_pending:
-        tracking_updates = []
-        for sheet_row in j_pending:
-            tracking_updates.append((f"{INVOICE_TAB}!K{sheet_row}", [[now_str]]))
-            tracking_updates.append((f"{INVOICE_TAB}!L{sheet_row}", [[USER_EMAIL]]))
-        sheets_batch_put(gtoken, tracking_updates)
-        print(f"      ✓ {len(j_pending)} ligne(s) tracée(s) → {now_str} / {USER_EMAIL}")
-    else:
-        print("      Aucune modification équipe non tracée")
-
-    print("\n" + "=" * 62)
-    print("  Terminé")
-    print(f"  + {added} nouvelle(s) facture(s) ajoutée(s)")
-    print(f"  ↻ {len(status_updates)} statut(s) mis à jour")
-    print(f"  💰 {len(payment_updates)//2} encaissement(s) renseigné(s)")
-    print(f"  ✎ {len(j_pending)} modification(s) équipe tracée(s)")
-    if credited_in_sheet:
-        print(f"  ✗ {len(credited_in_sheet)} facture(s) créditée(s) → Exclure")
-    print("=" * 62)
+        added, updated = run_incremental(gtoken)
+        print("\n" + "=" * 62)
+        print(f"  + {added} nouvelle(s) facture(s)")
+        print(f"  ↻ {updated} cellule(s) mise(s) à jour")
+        print("=" * 62)
 
 
 if __name__ == "__main__":
